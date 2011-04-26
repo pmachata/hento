@@ -25,8 +25,43 @@
 
 (defmethod piece-move-chain (board chain (blk puller-piece) xn yn)
   (unless (hento-board-has-block-at board xn yn)
-    (hento-chain-move chain blk xn yn)))
+    (hento-chain-pull chain blk xn yn)))
 
+
+(defclass pusher-piece (piece) ())
+
+(defmethod piece-surface ((blk pusher-piece) cache)
+  (tile-cache-get cache "pusher"))
+
+(defmethod piece-move-chain (board chain (blk pusher-piece) xn yn)
+  (let ((other (hento-board-has-block-at board xn yn)))
+    (if (null other)
+	(hento-chain-pull chain blk xn yn)
+
+      ;; We can only push our own chain...
+      (when (eq (car other) chain)
+	;; ...and only if the collision block is our direct neighbor.
+	(let ((my-pos (position blk (hento-chain-blocklist chain)))
+	      (other-pos (position (cdr other)
+				   (hento-chain-blocklist chain))))
+
+	  ;; Push is like pull of the pushed head in the direction
+	  ;; of the last chain link.
+	  (when (= (abs (- my-pos other-pos)) 1)
+	    ;; Turn the chain such that the new head is in the
+	    ;; beginning.
+	    (let ((blocklist (hento-chain-blocklist chain)))
+	      (when (> other-pos my-pos)
+		(setf (hento-chain-blocklist chain) (nreverse blocklist))))
+	    (let* ((lst (hento-chain-blocklist chain))
+		   (blk (car lst))
+		   (nxt (cadr lst))
+		   (dx (- (piece-x blk) (piece-x nxt)))
+		   (dy (- (piece-y blk) (piece-y nxt)))
+		   (xn (+ (piece-x blk) dx))
+		   (yn (+ (piece-y blk) dy)))
+	      (unless (hento-board-has-block-at board xn yn)
+		(hento-chain-pull chain blk xn yn)))))))))
 
 (defclass brick-piece (piece) ())
 
@@ -99,7 +134,7 @@
 		     (piece-paint prev cur next window cache))
 		 (hento-chain-blocklist chain)))
 
-(defun hento-chain-move (chain blk x y)
+(defun hento-chain-pull (chain blk x y)
   (let ((blocklist (hento-chain-blocklist chain)))
     (unless (eq blk (car blocklist))
       (setf (hento-chain-blocklist chain) (nreverse blocklist))))
@@ -118,23 +153,24 @@
   (do* ((x x0 (+ x dx))
 	(y y0 (+ y dy))
 	(i 0 (1+ i))
-	(blks))
+	(chain))
 
-      ((= i (length lst))
-       (make-hento-chain :blocklist blks))
+      ((= i (length lst)) (make-hento-chain :blocklist chain))
 
-    (let* ((cls (if (or (= i 0) (= i (1- (length lst))))
-		    'puller-piece 'piece))
+    (let* ((cls (if (> i 0)
+		    'piece
+		  (if (= 0 (random 5))
+		      'pusher-piece
+		    'puller-piece)))
 	   (blk (make-instance cls :x x :y y :color (elt lst i))))
-      (push blk blks))))
+      (push blk chain))))
 
 (defun make-hento-chain-random (len x0 y0 dx dy)
   (let ((colors '(:white :gray :red :green :blue :orange)))
-    (do ((i 0 (1+ i))
-	 (lst NIL (push (elt colors
-			     (random (length colors)))
-			lst)))
-	((= i len) (make-hento-chain-colors lst x0 y0 dx dy)))))
+    (make-hento-chain-colors (loop for i below len
+				   collecting (elt colors
+						   (random (length colors))))
+			     x0 y0 dx dy)))
 
 (defstruct hento-board
   w h tw th
@@ -191,7 +227,8 @@
 	   (dy (bound-dir (- y y0)))
 	   (xn (+ x0 dx))
 	   (yn (if (/= dx 0) y0 (+ y0 dy))))
-      (piece-move-chain board chain blk xn yn))))
+      (when (or (/= x0 xn) (/= y0 yn))
+	(piece-move-chain board chain blk xn yn)))))
 
 (defstruct tile-cache
   tiles)
@@ -231,14 +268,6 @@
 		:w board-w :h board-h))
 	(hold NIL))
 
-   (when NIL
-     (hento-board-add-chain board
-			    (make-hento-chain-random 7 1 1 +1 0))
-     (hento-board-add-chain board
-			    (make-hento-chain-random 9 1 2 +1 0))
-     (hento-board-add-chain board
-			    (make-hento-chain-random 11 1 3 +1 0)))
-
    (labels ((add-edge (x0 y0 dx dy steps)
 	      (do ((i 0 (1+ i))
 		   (x x0 (+ x dx))
@@ -262,12 +291,12 @@
      (:quit-event () t)
 
      (:mouse-button-down-event
-      (:x mousex :y mousey)
+      (:x mousex :y mousey :button btn)
       (let ((hld (hento-board-proximity-block board mousex mousey)))
 	(unless (null hld)
 	  (destructuring-bind (chain . blk) hld
-	    (setq hold hld)
-	    (format T "hold=~A~%" hold)))))
+	    (when (= btn sdl:sdl-button-left)
+	      (setq hold hld))))))
 
      (:mouse-button-up-event
       ()
@@ -284,7 +313,7 @@
        (let ((cx (floor (/ board-w 2)))
 	     (cy (floor (/ board-h 2))))
 	 (unless (hento-board-has-block-at board cx cy)
-	   (let ((chain (make-hento-chain-random 5 cx cy 0 0)))
+	   (let ((chain (make-hento-chain-random 5 cx cy 50 0)))
 	     (hento-board-add-chain board chain))))
        (hento-board-paint board window cache)
        (sdl:update-display)))))
