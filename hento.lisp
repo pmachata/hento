@@ -3,6 +3,18 @@
 (ql:quickload "lispbuilder-sdl")
 (ql:quickload "lispbuilder-sdl-ttf")
 
+(defun surface-paint (surface window x y)
+  (when surface
+    (let* ((tw (sdl:width surface))
+	   (th (sdl:height surface))
+	   (mx (* x tw))
+	   (my (* y th)))
+      (sdl:draw-surface-at-* surface mx my :surface window))))
+
+(defun tile-for-color (color)
+  (when color
+    (string-downcase (string color))))
+
 (defclass piece ()
   ((x :accessor piece-x
       :initarg :x)
@@ -11,14 +23,53 @@
    (color :accessor piece-color
 	  :initarg :color)))
 
-(defmethod piece-surface ((blk piece) cache)
-  (tile-cache-get cache "tile"))
-
 (defmethod piece-move-chain (board chain (blk piece) xn yn)
   nil)
 
+(defmethod piece-project ((blk piece))
+  blk)
 
-(defclass puller-piece (piece) ())
+(defmethod piece-paint (prev (cur piece) next window cache)
+  (surface-paint (piece-surface cur cache) window
+		 (piece-x cur) (piece-y cur))
+
+  (let ((color (piece-color cur)))
+    (when color
+      (surface-paint (tile-cache-get cache (tile-for-color color))
+		     window (piece-x cur) (piece-y cur)))))
+
+
+(defclass clamped-piece (piece) ())
+
+(defmethod piece-paint :after (prev (cur clamped-piece) next window cache)
+  (let* ((clamp-up (tile-cache-get cache "clamp-up"))
+	 (clamp-down (tile-cache-get cache "clamp-down"))
+	 (clamp-left (tile-cache-get cache "clamp-left"))
+	 (clamp-right (tile-cache-get cache "clamp-right")))
+
+    (labels ((paint-clamp (cur other dx dy clamp)
+			  (let* ((blk-x (piece-x cur))
+				 (blk-y (piece-y cur))
+				 (other-x (piece-x other))
+				 (other-y (piece-y other))
+				 (rdx (- other-x blk-x))
+				 (rdy (- other-y blk-y)))
+			    (when (and (= dx rdx) (= dy rdy))
+			      (surface-paint clamp window
+					     (piece-x cur) (piece-y cur))))))
+      (loop for other in (list prev next)
+	    do (unless (null other)
+		 (paint-clamp cur other 1 0 clamp-right)
+		 (paint-clamp cur other 0 1 clamp-down)
+		 (paint-clamp cur other -1 0 clamp-left)
+		 (paint-clamp cur other 0 -1 clamp-up))))))
+
+(defclass plain-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk plain-piece) cache)
+  (tile-cache-get cache "tile"))
+
+(defclass puller-piece (clamped-piece) ())
 
 (defmethod piece-surface ((blk puller-piece) cache)
   (tile-cache-get cache "puller"))
@@ -28,7 +79,7 @@
     (hento-chain-pull chain blk xn yn)))
 
 
-(defclass pusher-piece (piece) ())
+(defclass pusher-piece (clamped-piece) ())
 
 (defmethod piece-surface ((blk pusher-piece) cache)
   (tile-cache-get cache "pusher"))
@@ -69,55 +120,26 @@
 		(unless (hento-board-has-block-at board xn yn)
 		  (hento-chain-pull chain blk xn yn))))))))))
 
-(defclass brick-piece (piece) ())
+(defclass nonproj-piece (piece) ())
+
+(defmethod piece-project ((blk nonproj-piece))
+  nil)
+
+(defclass brick-piece (nonproj-piece) ())
 
 (defmethod piece-surface ((blk brick-piece) cache)
   (tile-cache-get cache "brick"))
 
 
+(defclass wooden-piece (nonproj-piece) ())
+
+(defmethod piece-surface ((blk wooden-piece) cache)
+  (tile-cache-get cache "wood"))
+
+
 (defun piece-at-p (blk x y)
   (and (= x (piece-x blk))
        (= y (piece-y blk))))
-
-(defun piece-paint (prev cur next window cache)
-  (let ((tile (piece-surface cur cache)))
-    (when tile
-      (let* ((clamp-up (tile-cache-get cache "clamp-up"))
-	     (clamp-down (tile-cache-get cache "clamp-down"))
-	     (clamp-left (tile-cache-get cache "clamp-left"))
-	     (clamp-right (tile-cache-get cache "clamp-right"))
-	     (tw (sdl:width tile))
-	     (th (sdl:height tile))
-	     (x0 (piece-x cur))
-	     (y0 (piece-y cur))
-	     (mx0 (* x0 tw))
-	     (my0 (* y0 th)))
-
-	(sdl:draw-surface-at-* tile mx0 my0 :surface window)
-
-	(labels ((paint-clamp (cur other dx dy clamp)
-			      (let* ((blk-x (piece-x cur))
-				     (blk-y (piece-y cur))
-				     (other-x (piece-x other))
-				     (other-y (piece-y other))
-				     (rdx (- other-x blk-x))
-				     (rdy (- other-y blk-y)))
-				(when (and (= dx rdx) (= dy rdy))
-				  (sdl:draw-surface-at-* clamp mx0 my0
-							 :surface window)))))
-	  (loop for other in (list prev next)
-		do (unless (null other)
-		     (paint-clamp cur other 1 0 clamp-right)
-		     (paint-clamp cur other 0 1 clamp-down)
-		     (paint-clamp cur other -1 0 clamp-left)
-		     (paint-clamp cur other 0 -1 clamp-up))))
-
-	(let ((color (piece-color cur)))
-	  (when color
-	    (let ((surface (tile-cache-get cache
-					   (string-downcase (string color)))))
-	      (sdl:draw-surface-at-* surface mx0 my0
-				     :surface window))))))))
 
 (defstruct hento-chain
   blocklist)
@@ -137,6 +159,9 @@
 	(lst l (cdr lst))
 	(ret NIL (push (funcall f pprev prev (car lst)) ret)))
       ((null (car lst)) (nreverse ret))))
+
+(defun hento-chain-map (f chain)
+  (mapcar f (hento-chain-blocklist chain)))
 
 (defun hento-chain-paint (chain window cache)
   (map-neighbors #'(lambda (prev cur next)
@@ -161,9 +186,12 @@
 (defun random-choice (lst)
   (elt lst (random (length lst))))
 
-(defun random-color-list (len)
+(defun random-color ()
   (let ((colors '(:white :gray :red :green :blue :orange NIL)))
-    (loop for i below len collecting (random-choice colors))))
+    (random-choice colors)))
+
+(defun random-color-list (len)
+  (loop for i below len collecting (random-color)))
 
 (defun layout-list (lst xys dx dy)
   (do* ((xys xys (cdr xys))
@@ -179,12 +207,12 @@
 
 (defun make-hento-chain-from-layout (lst)
   (labels ((puller-chain-piece (i len)
-	     (if (zerop i) 'puller-piece 'piece))
+	     (if (zerop i) 'puller-piece 'plain-piece))
 	   (pusher-chain-piece (i len)
-	     (if (zerop i) 'pusher-piece 'piece))
+	     (if (zerop i) 'pusher-piece 'plain-piece))
 	   (double-puller-chain-piece (i len)
 	     (if (or (zerop i) (= i (1- len)))
-		 'puller-piece 'piece)))
+		 'puller-piece 'plain-piece)))
     (let* ((templates (list #'puller-chain-piece
 			    #'pusher-chain-piece
 			    #'double-puller-chain-piece))
@@ -196,6 +224,7 @@
 				   (make-instance (funcall template i len)
 						  :color color :x x :y y)))))
       (make-hento-chain :blocklist pcs))))
+
 
 (defstruct hento-board
   w h tw th
@@ -258,19 +287,45 @@
       (when (or (/= x0 xn) (/= y0 yn))
 	(piece-move-chain board chain blk xn yn)))))
 
+(defun board-add-random-chain (board)
+  (let ((cx (hento-board-cx board))
+	(cy (hento-board-cy board)))
+    (unless (hento-board-has-block-at board cx cy)
+      (let* ((len (+ 3 (random 4)))
+	     (chain (make-hento-chain-from-layout
+		     (layout-list (random-color-list len)
+				  (list (list cx cy)
+					(list 1 (- (hento-board-h board) 2)))
+				  1 0))))
+	(hento-board-add-chain board chain)))))
+
+(defun board-explode (board color)
+  ;; project chains to an array
+  (let* ((w (hento-board-w board))
+	 (h (hento-board-h board))
+	 (arr (make-array (list w h))))
+    (loop for chain in (hento-board-chains board)
+	  do (hento-chain-map #'(lambda (piece)
+				  (let ((piece (piece-project piece)))
+				    (when piece
+				      (setf (aref arr (piece-x piece)
+						  (piece-y piece)) piece))))
+			      chain))))
+
 (defstruct tile-cache
   tiles)
 
 (defun tile-cache-get (cache key)
-  (let ((a (assoc key (tile-cache-tiles cache) :test 'string=)))
-    (when (null a)
-      (setq a (cons key
-		    (sdl::convert-to-display-format
-		     :surface (sdl:load-image (concatenate 'string key ".png"))
-		     :pixel-alpha t)))
-      (push a (tile-cache-tiles cache))
-      (format T "caching tile ~S: ~S~%" key a))
-    (cdr a)))
+  (unless (null key)
+    (let ((a (assoc key (tile-cache-tiles cache) :test 'string=)))
+      (when (null a)
+	(setq a (cons key
+		      (sdl::convert-to-display-format
+		       :surface (sdl:load-image (concatenate 'string key ".png"))
+		       :pixel-alpha t)))
+	(push a (tile-cache-tiles cache))
+	(format T "caching tile ~S: ~S~%" key a))
+      (cdr a))))
 
 (defun open-window (bw bh)
   (let ((tile (sdl:load-image "tile.png")))
@@ -282,6 +337,18 @@
 		:double-buffer T
 		:sw T)))
 
+(defstruct clock
+  prev)
+
+(defun clock-delta (clock)
+  (let ((now (get-internal-real-time)))
+    (float (/ (- now (clock-prev clock))
+	      internal-time-units-per-second))))
+
+(defun clock-reset (clock)
+  (let ((now (get-internal-real-time)))
+    (setf (clock-prev clock) now)))
+
 (sdl:with-init
  (sdl:sdl-init-video sdl:sdl-init-audio sdl:sdl-init-noparachute)
 
@@ -291,11 +358,13 @@
 	(cache (make-tile-cache))
 	(tile (tile-cache-get cache "tile"))
 	(board (make-hento-board
-		:tw (sdl:width tile)
-		:th (sdl:height tile)
+		:tw (sdl:width tile) :th (sdl:height tile)
 		:cx 5 :cy 5
 		:w board-w :h board-h))
-	(hold NIL))
+	(hold nil)
+	(next-color (random-color))
+	(game-over nil)
+	(clock (make-clock)))
 
    (labels ((add-edge (x0 y0 dx dy steps &optional (cls 'brick-piece))
 	      (do ((i 0 (1+ i))
@@ -312,6 +381,9 @@
      (add-edge 0 (1- board-h) +1 +0 board-w)
      (add-edge 0 1 0 +1 (- board-h 2))
      (add-edge (1- board-w) 1 0 +1 (- board-h 2)))
+
+   (clock-reset clock)
+   (board-add-random-chain board)
 
    (sdl:clear-display sdl:*black*) ;(sdl:color :r 255 :g 255 :b 255)
    (sdl:update-display)
@@ -339,17 +411,39 @@
 
      (:idle ()
        (sdl:clear-display sdl:*black*)
-       (let ((cx (hento-board-cx board))
-	     (cy (hento-board-cy board)))
-	 (unless (hento-board-has-block-at board cx cy)
-	   (let* ((len (+ 3 (random 4)))
-		  (chain (make-hento-chain-from-layout
-			  (layout-list (random-color-list len)
-				       (list (list cx cy)
-					     (list 1 (- board-h 2))) 1 0))))
-	     (hento-board-add-chain board chain))))
+       (let ((clk (clock-delta clock)))
+	 (when (> clk 3)
+	   (if (hento-board-has-block-at board
+					 (hento-board-cx board)
+					 (hento-board-cy board))
+	       (setf game-over t)
+	     (progn
+	       (board-explode board next-color)
+	       (clock-reset clock)
+	       (board-add-random-chain board)
+	       (setf next-color (random-color)))))
 
-       (hento-board-paint board window cache)
-       (sdl:update-display)))))
+	 (hento-board-paint board window cache)
+	 (let* ((gauge (tile-cache-get cache "gauge-base"))
+		(meter (tile-cache-get cache "gauge-meter"))
+		(bead (tile-cache-get cache (tile-for-color next-color)))
+		(w (sdl:width gauge))
+		(ww (round (/ (* w clk) 10)))
+		(h (sdl:height gauge))
+		(y0 (- 16 (floor (/ h 2))))
+		(x1 (+ y0 y0 w)))
+
+	   (unless (null gauge)
+	     (sdl:draw-surface-at-* gauge y0 y0 :surface window))
+
+	   (unless (null meter)
+	     (sdl:set-clip-rect (sdl:rectangle :x y0 :y y0 :w ww :h h)
+				:surface window)
+	     (sdl:blit-surface meter window)
+	     ;;(sdl:draw-surface-at-* gauge y0 y0 :surface window)
+	     (sdl:clear-clip-rect window))
+
+	   (surface-paint bead window 3 0)
+	   (sdl:update-display)))))))
 
 (quit)
