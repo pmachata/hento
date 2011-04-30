@@ -15,6 +15,21 @@
   (when color
     (string-downcase (string color))))
 
+(defstruct tile-cache
+  tiles)
+
+(defun tile-cache-get (cache key)
+  (unless (null key)
+    (let ((a (assoc key (tile-cache-tiles cache) :test 'string=)))
+      (when (null a)
+	(setq a (cons key
+		      (sdl::convert-to-display-format
+		       :surface (sdl:load-image (format nil "~A.png" key))
+		       :pixel-alpha t)))
+	(push a (tile-cache-tiles cache))
+	(format T "caching tile ~S: ~S~%" key a))
+      (cdr a))))
+
 (defclass piece ()
   ((x :accessor piece-x
       :initarg :x)
@@ -22,6 +37,17 @@
       :initarg :y)
    (color :accessor piece-color
 	  :initarg :color)))
+
+;;; Attempt to move the chain using anchor BLK that is to be moved to
+;;; position XN YN.
+(defgeneric piece-move-chain (board chain blk xn yn))
+
+;;; Paint a piece BLK on WINDOW.  PREV and NEXT pieces are given as
+;;; helpers.
+(defgeneric piece-paint (prev blk next window cache))
+
+;;; Return a surface for piece BLK.
+(defgeneric piece-surface (blk cache))
 
 (defmethod piece-move-chain (board chain (blk piece) xn yn)
   nil)
@@ -75,7 +101,7 @@
   (tile-cache-get cache "puller"))
 
 (defmethod piece-move-chain (board chain (blk puller-piece) xn yn)
-  (unless (hento-board-has-block-at board xn yn)
+  (unless (board-has-block-at board xn yn)
     (hento-chain-pull chain blk xn yn)))
 
 
@@ -85,15 +111,15 @@
   (tile-cache-get cache "pusher"))
 
 (defmethod piece-move-chain (board chain (blk pusher-piece) xn yn)
-  (let ((other (hento-board-has-block-at board xn yn)))
-    (if (null other)
+  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
+    (if (null other-chain)
 	(hento-chain-pull chain blk xn yn)
 
       ;; We can only push our own chain...
-      (when (eq (car other) chain)
+      (when (eq other-chain chain)
 	;; ...and only if the collision block is our direct neighbor.
 	(let ((my-pos (position blk (hento-chain-blocklist chain)))
-	      (other-pos (position (cdr other)
+	      (other-pos (position other-blk
 				   (hento-chain-blocklist chain))))
 
 	  ;; Push is like pull of the pushed head in the direction
@@ -117,7 +143,7 @@
 		(setf dy 0))
 	      (let ((xn (+ (piece-x blk) dx))
 		    (yn (+ (piece-y blk) dy)))
-		(unless (hento-board-has-block-at board xn yn)
+		(unless (board-has-block-at board xn yn)
 		  (hento-chain-pull chain blk xn yn))))))))))
 
 (defclass nonproj-piece (piece) ())
@@ -145,12 +171,12 @@
   blocklist)
 
 (defun hento-chain-has-block-at (chain x y)
-  (let* ((blocklist (hento-chain-blocklist chain)))
+  (let ((blocklist (hento-chain-blocklist chain)))
     (labels ((block-at (lst)
-	       (if (null lst) NIL
-		 (if (piece-at-p (car lst) x y)
-		     (cons chain (car lst))
-		   (block-at (cdr lst))))))
+		       (if (null lst) nil
+			 (if (piece-at-p (car lst) x y)
+			     (car lst)
+			   (block-at (cdr lst))))))
       (block-at blocklist))))
 
 (defun map-neighbors (f l)
@@ -187,7 +213,7 @@
   (elt lst (random (length lst))))
 
 (defun random-color ()
-  (let ((colors '(:white :gray :red :green :blue :orange NIL)))
+  (let ((colors '(:red :green :blue :white))); :orange :gray NIL)))
     (random-choice colors)))
 
 (defun random-color-list (len)
@@ -207,8 +233,10 @@
 
 (defun make-hento-chain-from-layout (lst)
   (labels ((puller-chain-piece (i len)
+	     (declare (ignorable len))
 	     (if (zerop i) 'puller-piece 'plain-piece))
 	   (pusher-chain-piece (i len)
+	     (declare (ignorable len))
 	     (if (zerop i) 'pusher-piece 'plain-piece))
 	   (double-puller-chain-piece (i len)
 	     (if (or (zerop i) (= i (1- len)))
@@ -226,58 +254,56 @@
       (make-hento-chain :blocklist pcs))))
 
 
-(defstruct hento-board
+(defstruct board
   w h tw th
   cx cy
   chains)
 
-(defun hento-board-tx (board mx)
-  (floor (/ mx (hento-board-tw board))))
+(defun board-tx (board mx)
+  (floor (/ mx (board-tw board))))
 
-(defun hento-board-ty (board my)
-  (floor (/ my (hento-board-th board))))
+(defun board-ty (board my)
+  (floor (/ my (board-th board))))
 
-(defun hento-board-add-chain (board chain)
-  (setf (hento-board-chains board)
-	(cons chain (hento-board-chains board))))
+(defun board-add-chain (board chain)
+  (push chain (board-chains board)))
 
-(defun hento-board-has-block-at (board x y)
-  (labels ((find-chain (chains)
-	     (if (null chains) NIL
-	       (let ((ret (hento-chain-has-block-at (car chains) x y)))
-		 (if (null ret) (find-chain (cdr chains))
-		   ret)))))
-    (find-chain (hento-board-chains board))))
+(defun board-has-block-at (board x y)
+  (dolist (chain (board-chains board))
+    (format t "~A~%" chain)
+    (let ((piece (hento-chain-has-block-at chain x y)))
+      (when piece
+	(return (values chain piece))))))
 
-(defun hento-board-proximity-block (board mx my)
-  (let* ((x (hento-board-tx board mx))
-	 (y (hento-board-ty board my)))
-    (hento-board-has-block-at board x y)))
+(defun board-proximity-block (board mx my)
+  (let* ((x (board-tx board mx))
+	 (y (board-ty board my)))
+    (board-has-block-at board x y)))
 
-(defun hento-board-paint (board window cache)
+(defun board-paint (board window cache)
   (let ((bg (tile-cache-get cache "background")))
     (sdl:draw-surface-at-* bg 0 0 :surface window))
 
   (let* ((port (tile-cache-get cache "port"))
-	 (tw (hento-board-tw board))
-	 (th (hento-board-th board))
-	 (x (- (* (hento-board-cx board) tw)
+	 (tw (board-tw board))
+	 (th (board-th board))
+	 (x (- (* (board-cx board) tw)
 	       (floor (/ (- (sdl:width port) tw) 2))))
-	 (y (- (* (hento-board-cy board) (hento-board-th board))
+	 (y (- (* (board-cy board) (board-th board))
 	       (floor (/ (- (sdl:height port) th) 2)))))
     (sdl:draw-surface-at-* port x y :surface window))
 
   (mapcar #'(lambda (chain)
 	      (hento-chain-paint chain window cache))
-	  (hento-board-chains board)))
+	  (board-chains board)))
 
-(defun hento-board-move-chain (board chain blk mx my)
+(defun board-move-chain (board chain blk mx my)
   (labels ((bound-dir (d)
 	     (cond ((> d 1) 1)
 		   ((< d -1) -1)
 		   (T d))))
-    (let* ((x (hento-board-tx board mx))
-	   (y (hento-board-ty board my))
+    (let* ((x (board-tx board mx))
+	   (y (board-ty board my))
 	   (x0 (piece-x blk))
 	   (y0 (piece-y blk))
 	   (dx (bound-dir (- x x0)))
@@ -288,44 +314,47 @@
 	(piece-move-chain board chain blk xn yn)))))
 
 (defun board-add-random-chain (board)
-  (let ((cx (hento-board-cx board))
-	(cy (hento-board-cy board)))
-    (unless (hento-board-has-block-at board cx cy)
+  (let ((cx (board-cx board))
+	(cy (board-cy board)))
+    (unless (board-has-block-at board cx cy)
       (let* ((len (+ 3 (random 4)))
 	     (chain (make-hento-chain-from-layout
 		     (layout-list (random-color-list len)
 				  (list (list cx cy)
-					(list 1 (- (hento-board-h board) 2)))
+					(list 1 (- (board-h board) 2)))
 				  1 0))))
-	(hento-board-add-chain board chain)))))
+	(board-add-chain board chain)))))
 
-(defun board-explode (board color)
-  ;; project chains to an array
-  (let* ((w (hento-board-w board))
-	 (h (hento-board-h board))
-	 (arr (make-array (list w h))))
-    (loop for chain in (hento-board-chains board)
+(defun board-project (board)
+  "Project pieces in chain to a 2D array and return it.  Each cell of
+  the array contains either nil or a cons (piece . chain), where the
+  chain is the chain that the piece is a member of."
+  (let* ((w (board-w board))
+	 (h (board-h board))
+	 (arr (make-array (list w h) :initial-element nil)))
+    (loop for chain in (board-chains board)
 	  do (hento-chain-map #'(lambda (piece)
 				  (let ((piece (piece-project piece)))
 				    (when piece
 				      (setf (aref arr (piece-x piece)
 						  (piece-y piece)) piece))))
-			      chain))))
+			      chain))
+    arr))
 
-(defstruct tile-cache
-  tiles)
+(defun board-explode (board color)
+  (let ((arr (board-project board)))
+    (do* ((lst)
+	  (have)
+	  (x 0 (1+ x))
+	  (y 0 (if (< x (board-w board))
+		   y
+		 (progn
+		   (setq x 0)
+		   (1+ y)))))
 
-(defun tile-cache-get (cache key)
-  (unless (null key)
-    (let ((a (assoc key (tile-cache-tiles cache) :test 'string=)))
-      (when (null a)
-	(setq a (cons key
-		      (sdl::convert-to-display-format
-		       :surface (sdl:load-image (concatenate 'string key ".png"))
-		       :pixel-alpha t)))
-	(push a (tile-cache-tiles cache))
-	(format T "caching tile ~S: ~S~%" key a))
-      (cdr a))))
+	((= y (board-h board)) nil)
+
+      (format t "~Ax~A~%" x y))))
 
 (defun open-window (bw bh)
   (let ((tile (sdl:load-image "tile.png")))
@@ -357,7 +386,7 @@
 	(window (open-window board-w board-h))
 	(cache (make-tile-cache))
 	(tile (tile-cache-get cache "tile"))
-	(board (make-hento-board
+	(board (make-board
 		:tw (sdl:width tile) :th (sdl:height tile)
 		:cx 5 :cy 5
 		:w board-w :h board-h))
@@ -372,8 +401,8 @@
 		   (y y0 (+ y dy))
 		   (chain NIL))
 		  ((= i steps)
-		   (hento-board-add-chain board
-					  (make-hento-chain :blocklist chain)))
+		   (board-add-chain board
+				    (make-hento-chain :blocklist chain)))
 		(push (make-instance cls :x x :y y :color NIL)
 		      chain))))
      (add-edge 0 0 +1 +0 board-w)
@@ -391,31 +420,32 @@
    (sdl:with-events ()
      (:quit-event () t)
 
-     (:mouse-button-down-event
-      (:x mousex :y mousey :button btn)
-      (let ((hld (hento-board-proximity-block board mousex mousey)))
-	(unless (null hld)
-	  (destructuring-bind (chain . blk) hld
-	    (when (= btn sdl:sdl-button-left)
-	      (setq hold hld))))))
+     (:mouse-button-down-event (:x mousex :y mousey :button btn)
+       (when (= btn sdl:sdl-button-left)
+	 (multiple-value-bind (chain piece)
+	     (board-proximity-block board mousex mousey)
+	   (when chain
+	     (setf hold (cons chain piece))))))
 
-     (:mouse-button-up-event
-      ()
-      (setq hold NIL))
+     (:key-down-event (:key key)
+       (cond ((sdl:key= key :sdl-key-escape)
+	      (sdl:push-quit-event))))
 
-     (:mouse-motion-event
-      (:x mousex :y mousey)
-      (unless (null hold)
-	(destructuring-bind (chain . blk) hold
-	  (hento-board-move-chain board chain blk mousex mousey))))
+     (:mouse-button-up-event ()
+       (setq hold nil))
+
+     (:mouse-motion-event (:x mousex :y mousey)
+       (unless (null hold)
+	 (destructuring-bind (chain . blk) hold
+	   (board-move-chain board chain blk mousex mousey))))
 
      (:idle ()
        (sdl:clear-display sdl:*black*)
        (let ((clk (clock-delta clock)))
 	 (when (> clk 3)
-	   (if (hento-board-has-block-at board
-					 (hento-board-cx board)
-					 (hento-board-cy board))
+	   (if (board-has-block-at board
+				   (board-cx board)
+				   (board-cy board))
 	       (setf game-over t)
 	     (progn
 	       (board-explode board next-color)
@@ -423,15 +453,14 @@
 	       (board-add-random-chain board)
 	       (setf next-color (random-color)))))
 
-	 (hento-board-paint board window cache)
+	 (board-paint board window cache)
 	 (let* ((gauge (tile-cache-get cache "gauge-base"))
 		(meter (tile-cache-get cache "gauge-meter"))
 		(bead (tile-cache-get cache (tile-for-color next-color)))
 		(w (sdl:width gauge))
 		(ww (round (/ (* w clk) 10)))
 		(h (sdl:height gauge))
-		(y0 (- 16 (floor (/ h 2))))
-		(x1 (+ y0 y0 w)))
+		(y0 (- 16 (floor (/ h 2)))))
 
 	   (unless (null gauge)
 	     (sdl:draw-surface-at-* gauge y0 y0 :surface window))
