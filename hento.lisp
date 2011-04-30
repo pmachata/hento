@@ -26,8 +26,7 @@
 		      (sdl::convert-to-display-format
 		       :surface (sdl:load-image (format nil "~A.png" key))
 		       :pixel-alpha t)))
-	(push a (tile-cache-tiles cache))
-	(format T "caching tile ~S: ~S~%" key a))
+	(push a (tile-cache-tiles cache)))
       (cdr a))))
 
 (defclass piece ()
@@ -194,6 +193,11 @@
 		     (piece-paint prev cur next window cache))
 		 (hento-chain-blocklist chain)))
 
+(defun chain-remove-piece (chain piece)
+  (setf (hento-chain-blocklist chain)
+	(delete-if #'(lambda (other) (eq piece other))
+		   (hento-chain-blocklist chain))))
+
 (defun hento-chain-pull (chain blk x y)
   (let ((blocklist (hento-chain-blocklist chain)))
     (unless (eq blk (car blocklist))
@@ -270,7 +274,6 @@
 
 (defun board-has-block-at (board x y)
   (dolist (chain (board-chains board))
-    (format t "~A~%" chain)
     (let ((piece (hento-chain-has-block-at chain x y)))
       (when piece
 	(return (values chain piece))))))
@@ -313,7 +316,7 @@
       (when (or (/= x0 xn) (/= y0 yn))
 	(piece-move-chain board chain blk xn yn)))))
 
-(defun board-add-random-chain (board)
+(defun board-add-initial-chain (board)
   (let ((cx (board-cx board))
 	(cy (board-cy board)))
     (unless (board-has-block-at board cx cy)
@@ -327,8 +330,7 @@
 
 (defun board-project (board)
   "Project pieces in chain to a 2D array and return it.  Each cell of
-  the array contains either nil or a cons (piece . chain), where the
-  chain is the chain that the piece is a member of."
+  the array contains either nil or a piece."
   (let* ((w (board-w board))
 	 (h (board-h board))
 	 (arr (make-array (list w h) :initial-element nil)))
@@ -337,24 +339,61 @@
 				  (let ((piece (piece-project piece)))
 				    (when piece
 				      (setf (aref arr (piece-x piece)
-						  (piece-y piece)) piece))))
+						  (piece-y piece))
+					    piece))))
 			      chain))
     arr))
 
+(defun board-remove-piece (board piece)
+  (let ((x (piece-x piece))
+	(y (piece-y piece)))
+    (multiple-value-bind (chain piece) (board-has-block-at board x y)
+      (when chain
+	(chain-remove-piece chain piece)))))
+
+(defun score-of (group)
+  (let ((l (length group)))
+    (* l l)))
+
 (defun board-explode (board color)
-  (let ((arr (board-project board)))
-    (do* ((lst)
-	  (have)
-	  (x 0 (1+ x))
-	  (y 0 (if (< x (board-w board))
-		   y
-		 (progn
-		   (setq x 0)
-		   (1+ y)))))
+  (labels ((uniq-enque (que seen x y)
+		       (let ((xy (cons x y)))
+			 (if (member xy seen :test 'equal)
+			     que
+			   (cons xy que)))))
+    (let ((arr (board-project board))
+	  (seen)
+	  (score 0))
+      (dotimes (x (board-w board))
+	(dotimes (y (board-h board))
+	  ;;(format t "~A considering ~Ax~A seen ~A~%" color x y (length seen))
+	  (unless (member (cons x y) seen :test 'equal)
+	    (do ((que (list (cons x y)))
+		 (group))
 
-	((= y (board-h board)) nil)
+		((null que)
+		 (when (>= (length group) 3)
+		   (dolist (piece group)
+		     (board-remove-piece board piece))
+		   (incf score (score-of group))))
 
-      (format t "~Ax~A~%" x y))))
+	      (let ((xy (pop que)))
+		(push xy seen)
+		(destructuring-bind (x . y) xy
+		  (let ((piece (aref arr x y)))
+		    (when piece
+		      (when (eq (piece-color piece) color)
+			;;(format t "~A found ~A~%" color piece)
+			(push piece group)
+			;; We need to consider all surrouding
+			;; directions, even up, to handle *-pieces in
+			;; shapes like this:  #  *
+			;;                   *####
+			(setf que (uniq-enque que seen x (1- y)))
+			(setf que (uniq-enque que seen x (1+ y)))
+			(setf que (uniq-enque que seen (1- x) y))
+			(setf que (uniq-enque que seen (1+ x) y)))))))))))
+      score)))
 
 (defun open-window (bw bh)
   (let ((tile (sdl:load-image "tile.png")))
@@ -378,6 +417,19 @@
   (let ((now (get-internal-real-time)))
     (setf (clock-prev clock) now)))
 
+
+(defstruct score-display
+  (score 0)
+  (shown 0))
+
+(defun score-inc (score add)
+  (incf (score-display-score score) add))
+
+(defun score-tick (score)
+  (when (< (score-display-shown score) (score-display-score score))
+    (incf (score-display-shown score))))
+
+
 (sdl:with-init
  (sdl:sdl-init-video sdl:sdl-init-audio sdl:sdl-init-noparachute)
 
@@ -393,7 +445,8 @@
 	(hold nil)
 	(next-color (random-color))
 	(game-over nil)
-	(clock (make-clock)))
+	(clock (make-clock))
+	(score (make-score-display)))
 
    (labels ((add-edge (x0 y0 dx dy steps &optional (cls 'brick-piece))
 	      (do ((i 0 (1+ i))
@@ -412,7 +465,7 @@
      (add-edge (1- board-w) 1 0 +1 (- board-h 2)))
 
    (clock-reset clock)
-   (board-add-random-chain board)
+   (board-add-initial-chain board)
 
    (sdl:clear-display sdl:*black*) ;(sdl:color :r 255 :g 255 :b 255)
    (sdl:update-display)
@@ -441,8 +494,9 @@
 
      (:idle ()
        (sdl:clear-display sdl:*black*)
+       (score-tick score)
        (let ((clk (clock-delta clock)))
-	 (when (> clk 3)
+	 (when (> clk 10)
 	   (if (board-has-block-at board
 				   (board-cx board)
 				   (board-cy board))
@@ -450,7 +504,7 @@
 	     (progn
 	       (board-explode board next-color)
 	       (clock-reset clock)
-	       (board-add-random-chain board)
+	       (board-add-initial-chain board)
 	       (setf next-color (random-color)))))
 
 	 (board-paint board window cache)
