@@ -143,7 +143,44 @@
 	      (let ((xn (+ (piece-x blk) dx))
 		    (yn (+ (piece-y blk) dy)))
 		(unless (board-has-block-at board xn yn)
-		  (hento-chain-pull chain blk xn yn))))))))))
+		  (hento-chain-pull chain blk xn yn))))
+
+	    ;; Don't change the hold
+	    (values chain blk)))))))
+
+
+(defclass attacher-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk attacher-piece) cache)
+  (tile-cache-get cache "attacher"))
+
+(defmethod piece-move-chain (board chain (blk attacher-piece) xn yn)
+  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
+    (if (null other-chain)
+	(hento-chain-pull chain blk xn yn)
+      ;; If the place is taken and this chain is formed by this single
+      ;; block, and it's one of the ends of the other block, then
+      ;; attach.
+      (when (null (cdr (hento-chain-blocklist chain)))
+	(labels ((make-new-blk ()
+			       (make-instance 'puller-piece
+					      :color (piece-color blk)
+					      :x (piece-x blk)
+					      :y (piece-y blk))))
+	  (cond ((eq other-blk
+		     (car (hento-chain-blocklist other-chain)))
+		 (let ((nblk (make-new-blk)))
+		   (push nblk (hento-chain-blocklist other-chain))
+		   (chain-remove-piece chain blk)
+		   (values other-chain nblk)))
+
+		((eq other-blk
+		     (car (last (hento-chain-blocklist other-chain))))
+		 (let ((nblk (make-new-blk)))
+		   (push nblk (cdr (last (hento-chain-blocklist other-chain))))
+		   (chain-remove-piece chain blk)
+		   (values other-chain nblk)))))))))
+
 
 (defclass nonproj-piece (piece) ())
 
@@ -211,7 +248,8 @@
 		   (setf (piece-x blk) x)
 		   (setf (piece-y blk) y)
 		   (shift (cdr lst) x0 y0))))))
-    (shift (hento-chain-blocklist chain) x y)))
+    (shift (hento-chain-blocklist chain) x y))
+  (values chain blk))
 
 (defun random-choice (lst)
   (elt lst (random (length lst))))
@@ -244,18 +282,27 @@
 	     (if (zerop i) 'pusher-piece 'plain-piece))
 	   (double-puller-chain-piece (i len)
 	     (if (or (zerop i) (= i (1- len)))
-		 'puller-piece 'plain-piece)))
+		 'puller-piece 'plain-piece))
+	   (attacher-chain-piece (i len)
+	     (declare (ignorable len))
+	     (when (zerop i) 'attacher-piece)))
+
     (let* ((templates (list #'puller-chain-piece
 			    #'pusher-chain-piece
-			    #'double-puller-chain-piece))
+			    #'double-puller-chain-piece
+		            #'attacher-chain-piece))
 	   (template (random-choice templates))
 	   (len (length lst))
-	   (pcs (loop for emt in lst
-		      for i by 1
-		      collecting (destructuring-bind (color x y) emt
-				   (make-instance (funcall template i len)
-						  :color color :x x :y y)))))
-      (make-hento-chain :blocklist pcs))))
+	   (pcs (remove-if #'null
+			   (loop for emt in lst
+				 for i by 1
+				 collecting (destructuring-bind (color x y) emt
+					      (let ((cls (funcall template i len)))
+						(when cls
+						  (make-instance cls
+								 :color color
+								 :x x :y y))))))))
+      (make-hento-chain :blocklist (remove-if #'null pcs)))))
 
 
 (defstruct board
@@ -320,29 +367,40 @@
   (let ((cx (board-cx board))
 	(cy (board-cy board)))
     (unless (board-has-block-at board cx cy)
-      (let* ((len (+ 3 (random 4)))
+      (let* ((len (+ 2 (random 5)))
 	     (chain (make-hento-chain-from-layout
 		     (layout-list (random-color-list len)
 				  (list (list cx cy)
-					(list 1 (- (board-h board) 2)))
+					(list (board-w board) 0))
 				  1 0))))
 	(board-add-chain board chain)))))
 
 (defun board-project (board)
   "Project pieces in chain to a 2D array and return it.  Each cell of
   the array contains either nil or a piece."
-  (let* ((w (board-w board))
-	 (h (board-h board))
-	 (arr (make-array (list w h) :initial-element nil)))
-    (loop for chain in (board-chains board)
-	  do (hento-chain-map #'(lambda (piece)
-				  (let ((piece (piece-project piece)))
-				    (when piece
-				      (setf (aref arr (piece-x piece)
-						  (piece-y piece))
-					    piece))))
-			      chain))
-    arr))
+  (labels ((initial-piece-p (piece)
+			    (or (and (= (board-cx board) (piece-x piece))
+				     (= (board-cy board) (piece-y piece)))
+				(>= (piece-x piece) (board-w board))
+				(< (piece-x piece) 0)
+				(>= (piece-y piece) (board-h board))
+				(< (piece-y piece) 0)))
+	   (initial-chain-p (chain)
+			    (some #'initial-piece-p
+				  (hento-chain-blocklist chain))))
+    (let* ((w (board-w board))
+	   (h (board-h board))
+	   (arr (make-array (list w h) :initial-element nil)))
+      (loop for chain in (board-chains board)
+	    if (not (initial-chain-p chain))
+	    do (hento-chain-map #'(lambda (piece)
+				    (let ((piece (piece-project piece)))
+				      (when piece
+					(setf (aref arr (piece-x piece)
+						    (piece-y piece))
+					      piece))))
+				chain))
+      arr)))
 
 (defun board-remove-piece (board piece)
   (let ((x (piece-x piece))
@@ -433,14 +491,14 @@
 (sdl:with-init
  (sdl:sdl-init-video sdl:sdl-init-audio sdl:sdl-init-noparachute)
 
- (let* ((board-w 11)
+ (let* ((board-w 13)
 	(board-h 13)
 	(window (open-window board-w board-h))
 	(cache (make-tile-cache))
 	(tile (tile-cache-get cache "tile"))
 	(board (make-board
 		:tw (sdl:width tile) :th (sdl:height tile)
-		:cx 5 :cy 5
+		:cx 6 :cy 6
 		:w board-w :h board-h))
 	(hold nil)
 	(next-color (random-color))
@@ -459,7 +517,7 @@
 		(push (make-instance cls :x x :y y :color NIL)
 		      chain))))
      (add-edge 0 0 +1 +0 board-w)
-     (add-edge 0 (- board-h 3) +1 +0 board-w)
+     ;;(add-edge 0 (- board-h 3) +1 +0 board-w)
      (add-edge 0 (1- board-h) +1 +0 board-w)
      (add-edge 0 1 0 +1 (- board-h 2))
      (add-edge (1- board-w) 1 0 +1 (- board-h 2)))
@@ -485,26 +543,38 @@
 	      (sdl:push-quit-event))))
 
      (:mouse-button-up-event ()
-       (setq hold nil))
+       (setf hold nil))
 
      (:mouse-motion-event (:x mousex :y mousey)
        (unless (null hold)
 	 (destructuring-bind (chain . blk) hold
-	   (board-move-chain board chain blk mousex mousey))))
+	   (multiple-value-bind (chain blk)
+	       (board-move-chain board chain blk mousex mousey)
+	     (when chain
+	       (setf hold (cons chain blk)))))))
 
      (:idle ()
        (sdl:clear-display sdl:*black*)
        (score-tick score)
        (let ((clk (clock-delta clock)))
-	 (when (> clk 10)
+	 (when (> clk 5)
 	   (if (board-has-block-at board
 				   (board-cx board)
 				   (board-cy board))
-	       (setf game-over t)
+	       (format t "GAME OVER~%")
 	     (progn
 	       (board-explode board next-color)
-	       (clock-reset clock)
 	       (board-add-initial-chain board)
+
+	       ;; if what we are holding disappeared, drop it
+	       (unless (null hold)
+		 (destructuring-bind (chain . blk) hold
+		   (multiple-value-bind (chain piece)
+		       (board-has-block-at board (piece-x blk) (piece-y blk))
+		     (unless (eq piece blk)
+		       (setf hold nil)))))
+
+	       (clock-reset clock)
 	       (setf next-color (random-color)))))
 
 	 (board-paint board window cache)
@@ -512,7 +582,7 @@
 		(meter (tile-cache-get cache "gauge-meter"))
 		(bead (tile-cache-get cache (tile-for-color next-color)))
 		(w (sdl:width gauge))
-		(ww (round (/ (* w clk) 10)))
+		(ww (round (/ (* w clk) 5)))
 		(h (sdl:height gauge))
 		(y0 (- 16 (floor (/ h 2)))))
 
