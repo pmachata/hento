@@ -29,6 +29,15 @@
 	(push a (tile-cache-tiles cache)))
       (cdr a))))
 
+
+(defstruct board
+  w h tw th
+  cx cy
+  chains)
+
+(defstruct chain
+  blocklist)
+
 (defclass piece ()
   ((x :accessor piece-x
       :initarg :x)
@@ -52,168 +61,12 @@
 (defgeneric piece-project (blk))
 
 
-(defmethod piece-move-chain (board chain (blk piece) xn yn)
-  nil)
-
-(defmethod piece-project ((blk piece))
-  blk)
-
-(defmethod piece-paint (prev (cur piece) next window cache)
-  (surface-paint (piece-surface cur cache) window
-		 (piece-x cur) (piece-y cur))
-
-  (let ((color (piece-color cur)))
-    (when color
-      (surface-paint (tile-cache-get cache (tile-for-color color))
-		     window (piece-x cur) (piece-y cur)))))
-
-
-(defclass clamped-piece (piece) ())
-
-(defmethod piece-paint :after (prev (cur clamped-piece) next window cache)
-  (let* ((clamp-up (tile-cache-get cache "clamp-up"))
-	 (clamp-down (tile-cache-get cache "clamp-down"))
-	 (clamp-left (tile-cache-get cache "clamp-left"))
-	 (clamp-right (tile-cache-get cache "clamp-right")))
-
-    (labels ((paint-clamp (cur other dx dy clamp)
-			  (let* ((blk-x (piece-x cur))
-				 (blk-y (piece-y cur))
-				 (other-x (piece-x other))
-				 (other-y (piece-y other))
-				 (rdx (- other-x blk-x))
-				 (rdy (- other-y blk-y)))
-			    (when (and (= dx rdx) (= dy rdy))
-			      (surface-paint clamp window
-					     (piece-x cur) (piece-y cur))))))
-      (loop for other in (list prev next)
-	    do (unless (null other)
-		 (paint-clamp cur other 1 0 clamp-right)
-		 (paint-clamp cur other 0 1 clamp-down)
-		 (paint-clamp cur other -1 0 clamp-left)
-		 (paint-clamp cur other 0 -1 clamp-up))))))
-
-(defclass plain-piece (clamped-piece) ())
-
-(defmethod piece-surface ((blk plain-piece) cache)
-  (tile-cache-get cache "tile"))
-
-(defclass puller-piece (clamped-piece) ())
-
-(defmethod piece-surface ((blk puller-piece) cache)
-  (tile-cache-get cache "puller"))
-
-(defmethod piece-move-chain (board chain (blk puller-piece) xn yn)
-  (unless (board-has-block-at board xn yn)
-    (hento-chain-pull chain blk xn yn)))
-
-
-(defclass pusher-piece (clamped-piece) ())
-
-(defmethod piece-surface ((blk pusher-piece) cache)
-  (tile-cache-get cache "pusher"))
-
-(defmethod piece-move-chain (board chain (blk pusher-piece) xn yn)
-  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
-    (if (null other-chain)
-	(hento-chain-pull chain blk xn yn)
-
-      ;; We can only push our own chain...
-      (when (eq other-chain chain)
-	;; ...and only if the collision block is our direct neighbor.
-	(let ((my-pos (position blk (hento-chain-blocklist chain)))
-	      (other-pos (position other-blk
-				   (hento-chain-blocklist chain))))
-
-	  ;; Push is like pull of the pushed head in the direction
-	  ;; of the last chain link.
-	  (when (= (abs (- my-pos other-pos)) 1)
-	    ;; Turn the chain such that the new head is in the
-	    ;; beginning.
-	    (let ((blocklist (hento-chain-blocklist chain)))
-	      (when (> other-pos my-pos)
-		(setf (hento-chain-blocklist chain) (nreverse blocklist))))
-	    (let* ((lst (hento-chain-blocklist chain))
-		   (blk (car lst))
-		   (nxt (cadr lst))
-		   (dx (- (piece-x blk) (piece-x nxt)))
-		   (dy (- (piece-y blk) (piece-y nxt))))
-	      ;; If there's a discontinuity, assume that what happens
-	      ;; is that the chain is in the process of being pulled
-	      ;; out of the loading area.
-	      (when (or (< dx -1) (> dx 1) (< dy -1) (> dy 1))
-		(setf dx 1)
-		(setf dy 0))
-	      (let ((xn (+ (piece-x blk) dx))
-		    (yn (+ (piece-y blk) dy)))
-		(unless (board-has-block-at board xn yn)
-		  (hento-chain-pull chain blk xn yn))))
-
-	    ;; Don't change the hold
-	    (values chain blk)))))))
-
-
-(defclass attacher-piece (clamped-piece) ())
-
-(defmethod piece-surface ((blk attacher-piece) cache)
-  (tile-cache-get cache "wood"))
-
-(defmethod piece-move-chain (board chain (blk attacher-piece) xn yn)
-  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
-    (if (null other-chain)
-	(hento-chain-pull chain blk xn yn)
-      ;; If the place is taken, and the other block is not ephemeral
-      ;; (this is to disallow attaching to the border, but it may
-      ;; later be changed if ephemeral blocks are needed apart from
-      ;; border blocks), and it's one of the ends of the other block,
-      ;; then attach.
-      (unless (null (piece-project other-blk))
-	(labels ((make-new-blk ()
-			       (make-instance 'puller-piece
-					      :color (piece-color blk)
-					      :x (piece-x blk)
-					      :y (piece-y blk))))
-	  (cond ((eq other-blk
-		     (car (hento-chain-blocklist other-chain)))
-		 (let ((nblk (make-new-blk)))
-		   (push nblk (hento-chain-blocklist other-chain))
-		   (chain-remove-piece chain blk)
-		   (values other-chain nblk)))
-
-		((eq other-blk
-		     (car (last (hento-chain-blocklist other-chain))))
-		 (let ((nblk (make-new-blk)))
-		   (push nblk (cdr (last (hento-chain-blocklist other-chain))))
-		   (chain-remove-piece chain blk)
-		   (values other-chain nblk)))))))))
-
-
-(defclass nonproj-piece (piece) ())
-
-(defmethod piece-project ((blk nonproj-piece))
-  nil)
-
-(defclass brick-piece (nonproj-piece) ())
-
-(defmethod piece-surface ((blk brick-piece) cache)
-  (tile-cache-get cache "brick"))
-
-
-(defclass wooden-piece (nonproj-piece) ())
-
-(defmethod piece-surface ((blk wooden-piece) cache)
-  (tile-cache-get cache "wood"))
-
-
 (defun piece-at-p (blk x y)
   (and (= x (piece-x blk))
        (= y (piece-y blk))))
 
-(defstruct hento-chain
-  blocklist)
-
-(defun hento-chain-has-block-at (chain x y)
-  (let ((blocklist (hento-chain-blocklist chain)))
+(defun chain-has-block-at (chain x y)
+  (let ((blocklist (chain-blocklist chain)))
     (labels ((block-at (lst)
 		       (if (null lst) nil
 			 (if (piece-at-p (car lst) x y)
@@ -228,23 +81,23 @@
 	(ret NIL (push (funcall f pprev prev (car lst)) ret)))
       ((null (car lst)) (nreverse ret))))
 
-(defun hento-chain-map (f chain)
-  (mapcar f (hento-chain-blocklist chain)))
+(defun chain-map (f chain)
+  (mapcar f (chain-blocklist chain)))
 
-(defun hento-chain-paint (chain window cache)
+(defun chain-paint (chain window cache)
   (map-neighbors #'(lambda (prev cur next)
 		     (piece-paint prev cur next window cache))
-		 (hento-chain-blocklist chain)))
+		 (chain-blocklist chain)))
 
 (defun chain-remove-piece (chain piece)
-  (setf (hento-chain-blocklist chain)
+  (setf (chain-blocklist chain)
 	(delete-if #'(lambda (other) (eq piece other))
-		   (hento-chain-blocklist chain))))
+		   (chain-blocklist chain))))
 
-(defun hento-chain-pull (chain blk x y)
-  (let ((blocklist (hento-chain-blocklist chain)))
+(defun chain-pull (chain blk x y)
+  (let ((blocklist (chain-blocklist chain)))
     (unless (eq blk (car blocklist))
-      (setf (hento-chain-blocklist chain) (nreverse blocklist))))
+      (setf (chain-blocklist chain) (nreverse blocklist))))
   (labels ((shift (lst x y)
 	     (unless (null lst)
 	       (let* ((blk (car lst))
@@ -254,7 +107,7 @@
 		   (setf (piece-x blk) x)
 		   (setf (piece-y blk) y)
 		   (shift (cdr lst) x0 y0))))))
-    (shift (hento-chain-blocklist chain) x y))
+    (shift (chain-blocklist chain) x y))
   (values chain blk))
 
 (defun random-choice (lst)
@@ -279,16 +132,19 @@
 
     (push (list (car lst) x y) chain)))
 
-(defun make-hento-chain-from-layout (lst)
+(defun make-chain-from-layout (lst)
   (labels ((puller-chain-piece (i len)
 	     (declare (ignorable len))
 	     (if (zerop i) 'puller-piece 'plain-piece))
+
 	   (pusher-chain-piece (i len)
 	     (declare (ignorable len))
 	     (if (zerop i) 'pusher-piece 'plain-piece))
+
 	   (double-puller-chain-piece (i len)
 	     (if (or (zerop i) (= i (1- len)))
 		 'puller-piece 'plain-piece))
+
 	   (attacher-chain-piece (i len)
 	     (declare (ignorable len))
 	     (when (zerop i) 'attacher-piece)))
@@ -308,13 +164,8 @@
 						  (make-instance cls
 								 :color color
 								 :x x :y y))))))))
-      (make-hento-chain :blocklist (remove-if #'null pcs)))))
+      (make-chain :blocklist (remove-if #'null pcs)))))
 
-
-(defstruct board
-  w h tw th
-  cx cy
-  chains)
 
 (defun board-tx (board mx)
   (floor (/ mx (board-tw board))))
@@ -327,7 +178,7 @@
 
 (defun board-has-block-at (board x y)
   (dolist (chain (board-chains board))
-    (let ((piece (hento-chain-has-block-at chain x y)))
+    (let ((piece (chain-has-block-at chain x y)))
       (when piece
 	(return (values chain piece))))))
 
@@ -350,7 +201,7 @@
     (sdl:draw-surface-at-* port x y :surface window))
 
   (mapcar #'(lambda (chain)
-	      (hento-chain-paint chain window cache))
+	      (chain-paint chain window cache))
 	  (board-chains board)))
 
 (defun board-move-chain (board chain blk mx my)
@@ -374,7 +225,7 @@
 	(cy (board-cy board)))
     (unless (board-has-block-at board cx cy)
       (let* ((len (+ 2 (random 5)))
-	     (chain (make-hento-chain-from-layout
+	     (chain (make-chain-from-layout
 		     (layout-list (random-color-list len)
 				  (list (list cx cy)
 					(list (board-w board) 0))
@@ -393,19 +244,19 @@
 				(< (piece-y piece) 0)))
 	   (initial-chain-p (chain)
 			    (some #'initial-piece-p
-				  (hento-chain-blocklist chain))))
+				  (chain-blocklist chain))))
     (let* ((w (board-w board))
 	   (h (board-h board))
 	   (arr (make-array (list w h) :initial-element nil)))
       (loop for chain in (board-chains board)
 	    if (not (initial-chain-p chain))
-	    do (hento-chain-map #'(lambda (piece)
-				    (let ((piece (piece-project piece)))
-				      (when piece
-					(setf (aref arr (piece-x piece)
-						    (piece-y piece))
-					      piece))))
-				chain))
+	    do (chain-map #'(lambda (piece)
+			      (let ((piece (piece-project piece)))
+				(when piece
+				  (setf (aref arr (piece-x piece)
+					      (piece-y piece))
+					piece))))
+			  chain))
       arr)))
 
 (defun board-remove-piece (board piece)
@@ -458,6 +309,158 @@
 			(setf que (uniq-enque que seen (1- x) y))
 			(setf que (uniq-enque que seen (1+ x) y)))))))))))
       score)))
+
+
+
+(defmethod piece-project ((blk piece))
+  blk)
+
+(defmethod piece-paint (prev (cur piece) next window cache)
+  (surface-paint (piece-surface cur cache) window
+		 (piece-x cur) (piece-y cur))
+
+  (let ((color (piece-color cur)))
+    (when color
+      (surface-paint (tile-cache-get cache (tile-for-color color))
+		     window (piece-x cur) (piece-y cur)))))
+
+
+(defclass clamped-piece (piece) ())
+
+(defmethod piece-paint :after (prev (cur clamped-piece) next window cache)
+  (let* ((clamp-up (tile-cache-get cache "clamp-up"))
+	 (clamp-down (tile-cache-get cache "clamp-down"))
+	 (clamp-left (tile-cache-get cache "clamp-left"))
+	 (clamp-right (tile-cache-get cache "clamp-right")))
+
+    (labels ((paint-clamp (cur other dx dy clamp)
+			  (let* ((blk-x (piece-x cur))
+				 (blk-y (piece-y cur))
+				 (other-x (piece-x other))
+				 (other-y (piece-y other))
+				 (rdx (- other-x blk-x))
+				 (rdy (- other-y blk-y)))
+			    (when (and (= dx rdx) (= dy rdy))
+			      (surface-paint clamp window
+					     (piece-x cur) (piece-y cur))))))
+      (loop for other in (list prev next)
+	    do (unless (null other)
+		 (paint-clamp cur other 1 0 clamp-right)
+		 (paint-clamp cur other 0 1 clamp-down)
+		 (paint-clamp cur other -1 0 clamp-left)
+		 (paint-clamp cur other 0 -1 clamp-up))))))
+
+(defclass plain-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk plain-piece) cache)
+  (tile-cache-get cache "tile"))
+
+(defclass puller-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk puller-piece) cache)
+  (tile-cache-get cache "puller"))
+
+(defmethod piece-move-chain (board chain (blk puller-piece) xn yn)
+  (unless (board-has-block-at board xn yn)
+    (chain-pull chain blk xn yn)))
+
+
+(defclass pusher-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk pusher-piece) cache)
+  (tile-cache-get cache "pusher"))
+
+(defmethod piece-move-chain (board chain (blk pusher-piece) xn yn)
+  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
+    (if (null other-chain)
+	(chain-pull chain blk xn yn)
+
+      ;; We can only push our own chain...
+      (when (eq other-chain chain)
+	;; ...and only if the collision block is our direct neighbor.
+	(let ((my-pos (position blk (chain-blocklist chain)))
+	      (other-pos (position other-blk
+				   (chain-blocklist chain))))
+
+	  ;; Push is like pull of the pushed head in the direction
+	  ;; of the last chain link.
+	  (when (= (abs (- my-pos other-pos)) 1)
+	    ;; Turn the chain such that the new head is in the
+	    ;; beginning.
+	    (let ((blocklist (chain-blocklist chain)))
+	      (when (> other-pos my-pos)
+		(setf (chain-blocklist chain) (nreverse blocklist))))
+	    (let* ((lst (chain-blocklist chain))
+		   (blk (car lst))
+		   (nxt (cadr lst))
+		   (dx (- (piece-x blk) (piece-x nxt)))
+		   (dy (- (piece-y blk) (piece-y nxt))))
+	      ;; If there's a discontinuity, assume that what happens
+	      ;; is that the chain is in the process of being pulled
+	      ;; out of the loading area.
+	      (when (or (< dx -1) (> dx 1) (< dy -1) (> dy 1))
+		(setf dx 1)
+		(setf dy 0))
+	      (let ((xn (+ (piece-x blk) dx))
+		    (yn (+ (piece-y blk) dy)))
+		(unless (board-has-block-at board xn yn)
+		  (chain-pull chain blk xn yn))))
+
+	    ;; Don't change the hold
+	    (values chain blk)))))))
+
+
+(defclass attacher-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk attacher-piece) cache)
+  (tile-cache-get cache "wood"))
+
+(defmethod piece-move-chain (board chain (blk attacher-piece) xn yn)
+  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
+    (if (null other-chain)
+	(chain-pull chain blk xn yn)
+      ;; If the place is taken, and the other block is not ephemeral
+      ;; (this is to disallow attaching to the border, but it may
+      ;; later be changed if ephemeral blocks are needed apart from
+      ;; border blocks), and it's one of the ends of the other block,
+      ;; then attach.
+      (unless (null (piece-project other-blk))
+	(labels ((make-new-blk ()
+			       (make-instance 'puller-piece
+					      :color (piece-color blk)
+					      :x (piece-x blk)
+					      :y (piece-y blk))))
+	  (cond ((eq other-blk
+		     (car (chain-blocklist other-chain)))
+		 (let ((nblk (make-new-blk)))
+		   (push nblk (chain-blocklist other-chain))
+		   (chain-remove-piece chain blk)
+		   (values other-chain nblk)))
+
+		((eq other-blk
+		     (car (last (chain-blocklist other-chain))))
+		 (let ((nblk (make-new-blk)))
+		   (push nblk (cdr (last (chain-blocklist other-chain))))
+		   (chain-remove-piece chain blk)
+		   (values other-chain nblk)))))))))
+
+
+(defclass nonproj-piece (piece) ())
+
+(defmethod piece-project ((blk nonproj-piece))
+  nil)
+
+(defclass brick-piece (nonproj-piece) ())
+
+(defmethod piece-surface ((blk brick-piece) cache)
+  (tile-cache-get cache "brick"))
+
+
+(defclass wooden-piece (nonproj-piece) ())
+
+(defmethod piece-surface ((blk wooden-piece) cache)
+  (tile-cache-get cache "wood"))
+
 
 (defun open-window (bw bh)
   (let ((tile (sdl:load-image "tile.png")))
@@ -519,7 +522,7 @@
 		   (chain NIL))
 		  ((= i steps)
 		   (board-add-chain board
-				    (make-hento-chain :blocklist chain)))
+				    (make-chain :blocklist chain)))
 		(push (make-instance cls :x x :y y :color NIL)
 		      chain))))
      (add-edge 0 0 +1 +0 board-w)
