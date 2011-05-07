@@ -60,6 +60,9 @@
 ;;; Return a piece that will be used for discovering explosion areas.
 (defgeneric piece-project (blk))
 
+;;; A hook called when piece enters the game
+(defgeneric piece-materialized-hook (blk game))
+
 
 (defun piece-at-p (blk x y)
   (and (= x (piece-x blk))
@@ -89,6 +92,11 @@
 		     (piece-paint prev cur next window cache))
 		 (chain-blocklist chain)))
 
+(defun list-paint (lst window cache)
+  (mapcar #'(lambda (piece)
+	      (piece-paint nil piece nil window cache))
+	  lst))
+
 (defun chain-remove-piece (chain piece)
   (setf (chain-blocklist chain)
 	(delete-if #'(lambda (other) (eq piece other))
@@ -114,8 +122,17 @@
   (elt lst (random (length lst))))
 
 (defun random-color ()
-  (let ((colors '(:red :green :blue :white))); :orange :gray NIL)))
+  (let ((colors '(:red :green :blue :white :orange))); :gray NIL)))
     (random-choice colors)))
+
+(defun color-to-sdl (color)
+  (ecase color
+    (:red (sdl:color :r 255 :g 0 :b 0))
+    (:green (sdl:color :r 0 :g 255 :b 0))
+    (:blue (sdl:color :r 0 :g 0 :b 255))
+    (:white (sdl:color :r 255 :g 255 :b 255))
+    (:orange (sdl:color :r 255 :g 127 :b 0))
+    (:gray (sdl:color :r 127 :g 127 :b 127))))
 
 (defun random-color-list (len)
   (loop for i below len collecting (random-color)))
@@ -147,12 +164,17 @@
 
 	   (attacher-chain-piece (i len)
 	     (declare (ignorable len))
-	     (when (zerop i) 'attacher-piece)))
+	     (when (zerop i) 'attacher-piece))
+
+	   (pause-chain-piece (i len)
+	     (declare (ignorable len))
+	     (when (zerop i) 'pause-piece)))
 
     (let* ((templates (list #'puller-chain-piece
 			    #'pusher-chain-piece
 			    #'double-puller-chain-piece
-		            #'attacher-chain-piece))
+		            #'attacher-chain-piece
+			    #'pause-chain-piece))
 	   (template (random-choice templates))
 	   (len (length lst))
 	   (pcs (remove-if #'null
@@ -278,7 +300,8 @@
 			   (cons xy que)))))
     (let ((arr (board-project board))
 	  (seen)
-	  (score 0))
+	  (score 0)
+	  (exploded nil))
       (dotimes (x (board-w board))
 	(dotimes (y (board-h board))
 	  ;;(format t "~A considering ~Ax~A seen ~A~%" color x y (length seen))
@@ -289,7 +312,8 @@
 		((null que)
 		 (when (>= (length group) 3)
 		   (dolist (piece group)
-		     (board-remove-piece board piece))
+		     (board-remove-piece board piece)
+		     (push piece exploded))
 		   (incf score (score-of group))))
 
 	      (let ((xy (pop que)))
@@ -308,7 +332,7 @@
 			(setf que (uniq-enque que seen x (1+ y)))
 			(setf que (uniq-enque que seen (1- x) y))
 			(setf que (uniq-enque que seen (1+ x) y)))))))))))
-      score)))
+      (values score exploded))))
 
 
 
@@ -445,6 +469,24 @@
 		   (values other-chain nblk)))))))))
 
 
+(defclass pause-piece (clamped-piece) ())
+
+(defmethod piece-surface ((blk pause-piece) cache)
+  (tile-cache-get cache "pause"))
+
+(defmethod piece-move-chain (board chain (blk pause-piece) xn yn)
+  (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
+    (declare (ignorable other-blk))
+    (when (null other-chain)
+      (let ((nblk (make-instance 'puller-piece
+				 :color (piece-color blk)
+				 :x (piece-x blk)
+				 :y (piece-y blk))))
+	(setf (chain-blocklist chain) (list nblk))
+	(chain-pull chain nblk xn yn)
+	(values chain nblk)))))
+
+
 (defclass nonproj-piece (piece) ())
 
 (defmethod piece-project ((blk nonproj-piece))
@@ -497,6 +539,81 @@
     (incf (score-display-shown score))))
 
 
+(defclass particle ()
+  ((x :accessor particle-x
+      :initarg :x)
+   (y :accessor particle-y
+      :initarg :y)
+   (dx :accessor particle-dx
+       :initarg :dx)
+   (dy :accessor particle-dy
+       :initarg :dy)))
+
+(defgeneric particle-tick (particle))
+(defgeneric particle-paint (particle window))
+
+(defmethod particle-tick ((p particle))
+  (incf (particle-x p) (particle-dx p))
+  (incf (particle-y p) (particle-dy p)))
+
+;; Particle influenced by gravity
+(defclass gravity-particle (particle) ())
+
+(defmethod particle-tick :after ((p gravity-particle))
+  (incf (particle-dy p) 1))
+
+(defclass debris-particle (gravity-particle)
+  ((color :accessor debris-color
+	  :initarg :color)))
+
+(defmethod particle-paint ((p particle) window)
+  (let ((x (particle-x p))
+	(y (particle-y p)))
+    (sdl:draw-rectangle-* (1- x) (1- y) 3 3
+			  :surface window
+			  :color (debris-color p))))
+
+(defstruct particles
+  (lst nil))
+
+(defun particles-paint (particles window)
+  (loop for p in (particles-lst particles)
+	do (particle-paint p window))
+
+  (labels ((outside (p) (let ((x (particle-x p))
+			      (y (particle-y p)))
+			  (or (< x -10)
+			      (< y -10)
+			      (> x (sdl:width window))
+			      (> y (sdl:height window))))))
+    (setf (particles-lst particles)
+	  (delete-if #'outside (particles-lst particles)))))
+
+(defun particles-tick (particles)
+  (loop for p in (particles-lst particles)
+	do (particle-tick p)))
+
+(defun particle-add (particles p)
+  (push p (particles-lst particles)))
+
+(defun create-explosion (board particles piece)
+  (let* ((tw (board-tw board))
+	 (th (board-th board))
+	 (x0 (* tw (piece-x piece))) ; edge x
+	 (y0 (* th (piece-y piece))) ; edge y
+	 (cw (floor (/ tw 3))) ; count w
+	 (ch (floor (/ th 3))) ; count h
+	 (cw2 (floor (/ cw 2)))
+	 (ch2 (floor (/ ch 2))))
+    (dotimes (x cw)
+      (dotimes (y ch)
+	(let ((p (make-instance 'debris-particle
+				:x (+ x0 (* 3 x)) :dx (- x cw2)
+				:y (+ y0 (* 3 y)) :dy (- y ch2)
+				:color (color-to-sdl (piece-color piece)))))
+	  (particle-add particles p))))))
+
+
 (sdl:with-init
  (sdl:sdl-init-video sdl:sdl-init-audio sdl:sdl-init-noparachute)
 
@@ -513,7 +630,11 @@
 	(next-color (random-color))
 	(game-over nil)
 	(clock (make-clock))
-	(score (make-score-display)))
+	(x-clock (make-clock))
+	(score (make-score-display))
+	(font (sdl:initialise-default-font sdl:*font-10x20*))
+	(particles (make-particles))
+	(explosion-que nil))
 
    (labels ((add-edge (x0 y0 dx dy steps &optional (cls 'brick-piece))
 	      (do ((i 0 (1+ i))
@@ -532,6 +653,7 @@
      (add-edge (1- board-w) 1 0 +1 (- board-h 2)))
 
    (clock-reset clock)
+   (clock-reset x-clock)
    (board-add-initial-chain board)
 
    (sdl:clear-display sdl:*black*) ;(sdl:color :r 255 :g 255 :b 255)
@@ -565,6 +687,7 @@
      (:idle ()
        (sdl:clear-display sdl:*black*)
        (score-tick score)
+       (particles-tick particles)
        (let ((clk (clock-delta clock)))
 	 (when (> clk 5)
 	   (if (board-has-block-at board
@@ -573,8 +696,11 @@
 	       (progn
 		 (setq game-over t)
 		 (format t "GAME OVER~%"))
-	     (progn
-	       (board-explode board next-color)
+
+	     (multiple-value-bind (x-score x-ploded)
+		 (board-explode board next-color)
+	       (setf explosion-que (nconc explosion-que x-ploded))
+	       (score-inc score x-score)
 	       (board-add-initial-chain board)
 
 	       ;; if what we are holding disappeared, drop it
@@ -590,6 +716,7 @@
 	       (setf next-color (random-color)))))
 
 	 (board-paint board window cache)
+	 (list-paint explosion-que window cache)
 	 (let* ((gauge (tile-cache-get cache "gauge-base"))
 		(meter (tile-cache-get cache "gauge-meter"))
 		(bead (tile-cache-get cache (tile-for-color next-color)))
@@ -608,7 +735,23 @@
 	     ;;(sdl:draw-surface-at-* gauge y0 y0 :surface window)
 	     (sdl:clear-clip-rect window))
 
-	   (surface-paint bead window 3 0)
-	   (sdl:update-display)))))))
+	   (surface-paint bead window 3 0)))
+
+       (unless (null explosion-que)
+	 (let ((clk (clock-delta x-clock)))
+	   (when (> clk 0.05)
+	     (clock-reset x-clock)
+	     (let ((x-blk (pop explosion-que)))
+	       (create-explosion board particles x-blk)))))
+
+       (sdl:draw-string-solid-* (format nil "~A"
+					(score-display-shown score))
+				(- (sdl:width window) 10) 5
+				:font font
+				:surface window
+				:color sdl:*white*
+				:justify :right)
+       (particles-paint particles window)
+       (sdl:update-display)))))
 
 (quit)
