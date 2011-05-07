@@ -152,16 +152,18 @@
 (defclass attacher-piece (clamped-piece) ())
 
 (defmethod piece-surface ((blk attacher-piece) cache)
-  (tile-cache-get cache "attacher"))
+  (tile-cache-get cache "wood"))
 
 (defmethod piece-move-chain (board chain (blk attacher-piece) xn yn)
   (multiple-value-bind (other-chain other-blk) (board-has-block-at board xn yn)
     (if (null other-chain)
 	(hento-chain-pull chain blk xn yn)
-      ;; If the place is taken and this chain is formed by this single
-      ;; block, and it's one of the ends of the other block, then
-      ;; attach.
-      (when (null (cdr (hento-chain-blocklist chain)))
+      ;; If the place is taken, and the other block is not ephemeral
+      ;; (this is to disallow attaching to the border, but it may
+      ;; later be changed if ephemeral blocks are needed apart from
+      ;; border blocks), and it's one of the ends of the other block,
+      ;; then attach.
+      (unless (null (piece-project other-blk))
 	(labels ((make-new-blk ()
 			       (make-instance 'puller-piece
 					      :color (piece-color blk)
