@@ -48,6 +48,10 @@
 ;;; Return a surface for piece BLK.
 (defgeneric piece-surface (blk cache))
 
+;;; Return a piece that will be used for discovering explosion areas.
+(defgeneric piece-project (blk))
+
+
 (defmethod piece-move-chain (board chain (blk piece) xn yn)
   nil)
 
@@ -563,16 +567,19 @@
 	   (if (board-has-block-at board
 				   (board-cx board)
 				   (board-cy board))
-	       (format t "GAME OVER~%")
+	       (progn
+		 (setq game-over t)
+		 (format t "GAME OVER~%"))
 	     (progn
 	       (board-explode board next-color)
 	       (board-add-initial-chain board)
 
 	       ;; if what we are holding disappeared, drop it
 	       (unless (null hold)
-		 (destructuring-bind (chain . blk) hold
+		 (let ((blk (cdr hold)))
 		   (multiple-value-bind (chain piece)
 		       (board-has-block-at board (piece-x blk) (piece-y blk))
+		     (declare (ignorable chain))
 		     (unless (eq piece blk)
 		       (setf hold nil)))))
 
