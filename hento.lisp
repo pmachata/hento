@@ -1,3 +1,4 @@
+#!/usr/bin/sbcl --load
 ;(asdf:operate 'asdf:load-op :lispbuilder-sdl)
 ;(asdf:operate 'asdf:load-op :lispbuilder-sdl-ttf)
 (ql:quickload "lispbuilder-sdl")
